@@ -5,10 +5,15 @@ use rand::prelude::*;
 use serde_derive::{Deserialize, Serialize};
 use bincode::Options;
 use bincode::config::*;
+use std::collections::HashMap;
 
 fn listen(socket: &UdpSocket, buffer: &mut[u8]) -> usize {
-    let (number_of_bytes, src_addr) = socket.recv_from(buffer).expect("no data received");
-    number_of_bytes
+    match socket.recv_from(buffer) {
+        Ok((number_of_bytes, src_addr)) => {
+            number_of_bytes
+        },
+        _ => 0
+    }
 }
 
 fn send(socket: &UdpSocket, receiver: &str, msg: &[u8]) -> usize {
@@ -128,21 +133,22 @@ fn connect_to_tracker(socket: &UdpSocket, tracker_url: &String) -> Option<Tracke
     let bincode = make_custom_bincode();
 
     let tracker_connection_request = TrackerConnectionRequest {
-        connection_id: u64::from_be_bytes([0,0,4,23,39,16,25,128]), // magic constant 0x4
-        action: 0,
+        connection_id: u64::from_be_bytes([0,0,4,23,39,16,25,128]), // magic constant 0x41727101980
+        action: 0, // 0 means 'connect'
         transaction_id: rng.next_u32()
     };
 
     send(&socket, tracker_url, &bincode.serialize(&tracker_connection_request).unwrap());
     let mut recv_buf: Vec<u8> = vec![0; 16];
-    listen(&socket, &mut recv_buf);
-    println!("{:?}", recv_buf);
+    let bytes_read = listen(&socket, &mut recv_buf);
+    if bytes_read == 0 {
+        return None;
+    }
 
     let tracker_connection_response: TrackerConnectionResponse = bincode.deserialize(&recv_buf).unwrap();
     println!("{:?}", tracker_connection_response);
     assert!(tracker_connection_request.transaction_id == tracker_connection_response.transaction_id);
     assert!(tracker_connection_response.action == 0);
-    println!("established connection to tracker!");
 
     Some(
         TrackerConnection {
@@ -152,7 +158,7 @@ fn connect_to_tracker(socket: &UdpSocket, tracker_url: &String) -> Option<Tracke
     )
 }
 
-fn announce_to_tracker(socket: &UdpSocket, tracker_url: &String, magnet: &MagnetUriData, tracker_connection: &TrackerConnection) /*-> Option<TrackerAnnounceResponse>*/ {
+fn announce_to_tracker(socket: &UdpSocket, tracker_url: &String, magnet: &MagnetUriData, tracker_connection: &TrackerConnection) -> Option<TrackerAnnounceResponse> {
     let mut rng = rand::thread_rng();
     let bincode = make_custom_bincode();
 
@@ -161,7 +167,7 @@ fn announce_to_tracker(socket: &UdpSocket, tracker_url: &String, magnet: &Magnet
         action: 1,
         transaction_id: rng.next_u32(),
         info_hash: magnet.info_hash.as_bytes().to_vec(),
-        peer_id: "8466F12337DB7CD0AC5F9EA5D8EDBE0858C086CE".as_bytes().to_vec(),
+        peer_id: "-AZ2060-123456789012".as_bytes().to_vec(),
         downloaded: 0,
         left: 0,
         uploaded: 0,
@@ -173,21 +179,22 @@ fn announce_to_tracker(socket: &UdpSocket, tracker_url: &String, magnet: &Magnet
     };
     send(&socket, tracker_url, &bincode.serialize(&announce_request).unwrap());
     let mut recv_buf: Vec<u8> = vec![0; 500];
-    listen(&socket, &mut recv_buf);
+    let bytes_read = listen(&socket, &mut recv_buf);
+    if bytes_read == 0 {
+        return None
+    }
+
     println!("{:?}", recv_buf);
 
-    assert!(u32::from_be_bytes(recv_buf[4..8]) == announce_request.transaction_id);
+    assert!(u32::from_be_bytes(recv_buf[4..8].try_into().unwrap()) == announce_request.transaction_id);
 
     match recv_buf[..4] {
-        [0,0,0,3] => {
-            let message = std::str::from_utf8(&recv_buf[8..]).unwrap();
-            println!("error: {}", message);
-        },
-        _ => {
+        [0,0,0,1] => {
             println!("not an error");
-            // println!("{:?}", recv_buf);
 
+            println!("interval bytes: {:?}", &recv_buf[8..12]);
             let interval = u32::from_be_bytes(recv_buf[8..12].try_into().unwrap());
+            
             println!("interval: {}", interval);
 
             let leechers = u32::from_be_bytes(recv_buf[12..16].try_into().unwrap());
@@ -196,9 +203,16 @@ fn announce_to_tracker(socket: &UdpSocket, tracker_url: &String, magnet: &Magnet
             let seeders = u32::from_be_bytes(recv_buf[16..20].try_into().unwrap());
             println!("seeders: {}", seeders);
 
+            None
+
             // let tracker_announce_response: TrackerAnnounceResponse = bincode.deserialize(&recv_buf).unwrap();
             // println!("{:?}", tracker_announce_response);
         },
+        _ => {
+            let message = std::str::from_utf8(&recv_buf[8..]).unwrap();
+            println!("error: {}", message);
+            None
+        }
     }
 }
 
@@ -219,13 +233,29 @@ fn main () {
 
     println!("Using magnet data: {:?}", magnet);
 
-    let mut rng = rand::thread_rng();
-    let bincode = make_custom_bincode();
     let socket = UdpSocket::bind("0.0.0.0:0").expect("failed to bind host socket");
+    socket.set_read_timeout(Some(std::time::Duration::new(5,0))).expect("Failed to set read timeout on socket"); // setting a 5 second read timeout
 
-    let tracker_url = magnet.trackers.get(1).unwrap();
-    let tracker_connection = connect_to_tracker(&socket, &tracker_url).expect("Failed to connect to the tracker");
-    println!("{:?}", tracker_connection);
+    let mut tracker_connections = HashMap::<String, TrackerConnection>::new();
 
-    let announce_response = announce_to_tracker(&socket, tracker_url, &magnet, &tracker_connection);
+    for tracker_url in &magnet.trackers {
+        match connect_to_tracker(&socket, tracker_url) {
+            Some(tracker_connection) => {
+                tracker_connections.insert(tracker_url.to_string(), tracker_connection);
+            },
+            None => {
+                println!("Failed to connect to {}", tracker_url);
+            }
+        }
+    }
+
+    for (tracker_url, tracker_connection) in tracker_connections {
+        let announce_response = announce_to_tracker(&socket, &tracker_url, &magnet, &tracker_connection);
+    }
+
+    // let tracker_url = magnet.trackers.get(3).unwrap();
+    // let tracker_connection = connect_to_tracker(&socket, &tracker_url).expect("Failed to connect to the tracker");
+    // println!("{:?}", tracker_connection);
+
+    // let announce_response = announce_to_tracker(&socket, tracker_url, &magnet, &tracker_connection);
 }
